@@ -15,6 +15,10 @@ PAM authentication module with `PAM_IGNORE`, normally `pam_unix`:
   `root`;
 - names NSS does not know.
 
+`local_users` must name at least one account, so a break-glass account always
+exists. If it is missing or empty, the module logs that and treats every
+account as local: nothing is sent to the Auth API until it is set.
+
 The UID is whatever the host resolves for the name through NSS, whether the
 account lives in `/etc/passwd` or comes from sssd/LDAP. An Auth API user named
 `root@<user_domain>` therefore can never authenticate as the host's `root`.

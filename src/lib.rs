@@ -215,8 +215,12 @@ impl Config {
 
     // Accounts the Auth API must never decide: names in `local_users`, system
     // accounts below `min_uid` (root included), and names NSS does not know.
-    // These are left to the next PAM module.
+    // These are left to the next PAM module. Without any `local_users` there
+    // is no break-glass account, so every account is treated as local.
     fn handled_locally(&self, username: &str) -> bool {
+        if self.local_users.is_empty() {
+            return true;
+        }
         if self
             .local_users
             .iter()
@@ -615,6 +619,9 @@ unsafe fn authenticate(
             return PAM_IGNORE;
         }
     };
+    if config.local_users.is_empty() {
+        log("local_users is not set; treating every account as local");
+    }
     if config.handled_locally(&username) {
         return PAM_IGNORE;
     }
@@ -725,8 +732,17 @@ mod tests {
     }
 
     #[test]
+    fn every_account_is_local_without_local_users() {
+        for extra in ["", "local_users = []"] {
+            let config = config(extra);
+            assert!(config.validate().is_ok());
+            assert!(config.handled_locally("james"), "{extra:?}");
+        }
+    }
+
+    #[test]
     fn system_and_unknown_accounts_are_local() {
-        let config = config("");
+        let config = config(r#"local_users = ["james"]"#);
         assert!(config.handled_locally("root"));
         assert!(config.handled_locally("no-such-account-pam-rust-oidc"));
     }
