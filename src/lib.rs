@@ -3,6 +3,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -23,6 +24,8 @@ const PAM_AUTHTOK_ITEM: libc::c_int = 6;
 const PAM_PROMPT_ECHO_OFF: libc::c_int = 1;
 const DEFAULT_MIN_UID: libc::uid_t = 1000;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const SUDOERS_PATH: &str = "/etc/sudoers";
+const MAX_SUDOERS_DEPTH: u8 = 4;
 
 #[repr(C)]
 struct PamMessage {
@@ -228,10 +231,30 @@ impl Config {
         {
             return true;
         }
-        match lookup_uid(username) {
-            Some(uid) => uid < self.min_uid,
+        match lookup_ids(username) {
+            Some((uid, _)) => uid < self.min_uid,
             None => true,
         }
+    }
+
+    // The Auth API is only used while a working break-glass account exists:
+    // at least one `local_users` entry must be UID 0 or be granted ALL
+    // commands by the local sudoers files (a best-effort reading of them).
+    fn break_glass_problem(&self) -> Option<&'static str> {
+        if self.local_users.is_empty() {
+            return Some("local_users is not set");
+        }
+        let mut lines = Vec::new();
+        collect_sudoers(Path::new(SUDOERS_PATH), 0, &mut lines);
+        if self
+            .local_users
+            .iter()
+            .filter_map(|name| load_account(name))
+            .any(|account| account.uid == 0 || sudoers_grants_all(&lines, &account))
+        {
+            return None;
+        }
+        Some("no account in local_users has full sudo access in the local sudoers files")
     }
 
     fn token_endpoint(&self) -> String {
@@ -426,9 +449,16 @@ fn read_root_only(path: &Path, description: &str) -> Result<Vec<u8>, String> {
     Ok(contents)
 }
 
-// Resolve an account's UID through NSS. `None` means the host does not know
-// the account or the lookup failed.
-fn lookup_uid(name: &str) -> Option<libc::uid_t> {
+struct Account {
+    name: String,
+    uid: libc::uid_t,
+    gids: Vec<libc::gid_t>,
+    groups: Vec<String>,
+}
+
+// Resolve an account's UID and primary GID through NSS. `None` means the host
+// does not know the account or the lookup failed.
+fn lookup_ids(name: &str) -> Option<(libc::uid_t, libc::gid_t)> {
     let c_name = CString::new(name).ok()?;
     let mut buffer: Vec<libc::c_char> = vec![0; 4096];
     loop {
@@ -450,8 +480,263 @@ fn lookup_uid(name: &str) -> Option<libc::uid_t> {
         if rc != 0 || result.is_null() {
             return None;
         }
-        return Some(passwd.pw_uid);
+        return Some((passwd.pw_uid, passwd.pw_gid));
     }
+}
+
+fn group_name(gid: libc::gid_t) -> Option<String> {
+    let mut buffer: Vec<libc::c_char> = vec![0; 4096];
+    loop {
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                &mut group,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 4, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || group.gr_name.is_null() {
+            return None;
+        }
+        return unsafe { CStr::from_ptr(group.gr_name) }
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+    }
+}
+
+// Resolve an account together with all of its groups.
+fn load_account(name: &str) -> Option<Account> {
+    let (uid, gid) = lookup_ids(name)?;
+    let c_name = CString::new(name).ok()?;
+    let mut gids: Vec<libc::gid_t> = vec![0; 64];
+    let mut count = gids.len() as libc::c_int;
+    // The group types differ between platforms, hence the inferred casts.
+    while unsafe {
+        libc::getgrouplist(
+            c_name.as_ptr(),
+            gid as _,
+            gids.as_mut_ptr() as *mut _,
+            &mut count,
+        )
+    } < 0
+    {
+        if gids.len() >= 65536 {
+            return None;
+        }
+        gids.resize(gids.len() * 4, 0);
+        count = gids.len() as libc::c_int;
+    }
+    gids.truncate(count.max(0) as usize);
+    let groups = gids.iter().filter_map(|gid| group_name(*gid)).collect();
+    Some(Account {
+        name: name.to_owned(),
+        uid,
+        gids,
+        groups,
+    })
+}
+
+// sudoers files are normally 0440 root:root and may be symlinks, so they get
+// a looser check than the module's own files: root-owned and not writable by
+// group or others.
+fn read_sudoers_file(path: &Path) -> Option<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return None;
+    }
+    let mut contents = Vec::new();
+    (&mut file)
+        .take(MAX_FILE_BYTES)
+        .read_to_end(&mut contents)
+        .ok()?;
+    String::from_utf8(contents).ok()
+}
+
+// Join continuation lines and drop comments and blank lines. A `#` starts a
+// comment unless it introduces a numeric ID (`#1000`, `%#10`) or an include
+// directive at the start of the line.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut pending = String::new();
+    for raw in text.lines() {
+        if let Some(continued) = raw.strip_suffix('\\') {
+            pending.push_str(continued);
+            continue;
+        }
+        pending.push_str(raw);
+        let bytes = pending.as_bytes();
+        let comment = (0..bytes.len()).find(|&index| {
+            bytes[index] == b'#'
+                && !bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
+                && !(index == 0 && pending.starts_with("#include"))
+        });
+        let line = pending[..comment.unwrap_or(pending.len())].trim();
+        if !line.is_empty() {
+            lines.push(line.to_owned());
+        }
+        pending.clear();
+    }
+    lines
+}
+
+// Collect the logical lines of a sudoers file and everything it includes.
+fn collect_sudoers(path: &Path, depth: u8, lines: &mut Vec<String>) {
+    let Some(text) = read_sudoers_file(path) else {
+        return;
+    };
+    let resolve = |target: &str| {
+        let target = Path::new(target.trim().trim_matches('"'));
+        path.parent().unwrap_or(Path::new("/")).join(target)
+    };
+    for line in logical_lines(&text) {
+        let directive = line.strip_prefix('@').or_else(|| line.strip_prefix('#'));
+        if let Some(target) = directive.and_then(|rest| rest.strip_prefix("includedir ")) {
+            let Ok(entries) = std::fs::read_dir(resolve(target)) else {
+                continue;
+            };
+            let mut names: Vec<_> = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| !name.contains('.') && !name.ends_with('~'))
+                })
+                .collect();
+            names.sort();
+            if depth < MAX_SUDOERS_DEPTH {
+                for name in names {
+                    collect_sudoers(&name, depth + 1, lines);
+                }
+            }
+        } else if let Some(target) = directive.and_then(|rest| rest.strip_prefix("include ")) {
+            if depth < MAX_SUDOERS_DEPTH {
+                collect_sudoers(&resolve(target), depth + 1, lines);
+            }
+        } else {
+            lines.push(line);
+        }
+    }
+}
+
+fn sudoers_item_names(
+    item: &str,
+    account: &Account,
+    aliases: &HashMap<&str, Vec<&str>>,
+    depth: u8,
+) -> bool {
+    if item == "ALL" || item == account.name {
+        return true;
+    }
+    if let Some(gid) = item.strip_prefix("%#") {
+        return gid.parse().is_ok_and(|gid| account.gids.contains(&gid));
+    }
+    if let Some(group) = item.strip_prefix('%') {
+        return account.groups.iter().any(|name| name == group);
+    }
+    if let Some(uid) = item.strip_prefix('#') {
+        return uid.parse() == Ok(account.uid);
+    }
+    depth < MAX_SUDOERS_DEPTH
+        && aliases.get(item).is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| sudoers_item_names(member, account, aliases, depth + 1))
+        })
+}
+
+// True if the command list of a user specification contains `ALL` to be run
+// as root, for example `(ALL:ALL) NOPASSWD: ALL`.
+fn sudoers_commands_grant_all(commands: &str) -> bool {
+    let mut rest = commands;
+    let mut as_root = true;
+    loop {
+        rest = rest.trim_start();
+        if let Some(runas) = rest.strip_prefix('(') {
+            let Some((runas, after)) = runas.split_once(')') else {
+                return false;
+            };
+            let users = runas.split(':').next().unwrap_or("");
+            as_root = users
+                .split(',')
+                .any(|user| matches!(user.trim(), "ALL" | "root" | "#0"));
+            rest = after.trim_start();
+        }
+        while let Some((tag, after)) = rest.split_once(':') {
+            if tag.is_empty() || !tag.bytes().all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+            {
+                break;
+            }
+            rest = after.trim_start();
+        }
+        let (command, after) = rest.split_once(',').unwrap_or((rest, ""));
+        if as_root && command.trim() == "ALL" {
+            return true;
+        }
+        if after.is_empty() {
+            return false;
+        }
+        rest = after;
+    }
+}
+
+// Best-effort reading of sudoers rules: true if a user specification naming
+// `account` grants ALL commands as root. Host lists are not evaluated, and
+// netgroups and non-file sources (LDAP, sssd) are not consulted.
+fn sudoers_grants_all(lines: &[String], account: &Account) -> bool {
+    let mut aliases: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut rules = Vec::new();
+    for line in lines {
+        if let Some(definitions) = line.strip_prefix("User_Alias") {
+            for definition in definitions.split(':') {
+                if let Some((name, members)) = definition.split_once('=') {
+                    aliases.insert(name.trim(), members.split(',').map(str::trim).collect());
+                }
+            }
+        } else if !["Defaults", "Host_Alias", "Runas_Alias", "Cmnd_Alias", "Cmd_Alias"]
+            .iter()
+            .any(|keyword| line.starts_with(keyword))
+        {
+            rules.push(line.as_str());
+        }
+    }
+    rules.iter().any(|rule| {
+        let Some((subjects, commands)) = rule.split_once('=') else {
+            return false;
+        };
+        // The user list ends at the first whitespace that does not follow a comma.
+        let mut users = String::new();
+        for word in subjects.split_whitespace() {
+            if !users.is_empty() && !users.ends_with(',') && !word.starts_with(',') {
+                break;
+            }
+            users.push_str(word);
+        }
+        let mut named = false;
+        for item in users.split(',') {
+            match item.strip_prefix('!') {
+                Some(excluded) if sudoers_item_names(excluded, account, &aliases, 0) => {
+                    return false
+                }
+                Some(_) => {}
+                None => named |= sudoers_item_names(item, account, &aliases, 0),
+            }
+        }
+        named && sudoers_commands_grant_all(commands)
+    })
 }
 
 fn unix_time() -> Result<u64, String> {
@@ -619,8 +904,9 @@ unsafe fn authenticate(
             return PAM_IGNORE;
         }
     };
-    if config.local_users.is_empty() {
-        log("local_users is not set; treating every account as local");
+    if let Some(problem) = config.break_glass_problem() {
+        log(&format!("{problem}; treating every account as local"));
+        return PAM_IGNORE;
     }
     if config.handled_locally(&username) {
         return PAM_IGNORE;
@@ -736,8 +1022,17 @@ mod tests {
         for extra in ["", "local_users = []"] {
             let config = config(extra);
             assert!(config.validate().is_ok());
+            assert_eq!(config.break_glass_problem(), Some("local_users is not set"));
             assert!(config.handled_locally("james"), "{extra:?}");
         }
+    }
+
+    #[test]
+    fn break_glass_needs_a_sudo_capable_account() {
+        let unknown = config(r#"local_users = ["no-such-account-pam-rust-oidc"]"#);
+        assert!(unknown.break_glass_problem().is_some());
+        let root = config(r#"local_users = ["root"]"#);
+        assert_eq!(root.break_glass_problem(), None);
     }
 
     #[test]
@@ -745,6 +1040,54 @@ mod tests {
         let config = config(r#"local_users = ["james"]"#);
         assert!(config.handled_locally("root"));
         assert!(config.handled_locally("no-such-account-pam-rust-oidc"));
+    }
+
+    fn account() -> Account {
+        Account {
+            name: "admin".into(),
+            uid: 1000,
+            gids: vec![1000, 10],
+            groups: vec!["admin".into(), "wheel".into()],
+        }
+    }
+
+    fn grants(sudoers: &str) -> bool {
+        sudoers_grants_all(&logical_lines(sudoers), &account())
+    }
+
+    #[test]
+    fn sudoers_rules_that_grant_all() {
+        for sudoers in [
+            "admin ALL=(ALL) ALL",
+            "admin ALL=(ALL:ALL) NOPASSWD: ALL",
+            "%wheel\tALL=(ALL)\tALL",
+            "%#10 ALL = ALL",
+            "#1000 ALL=(root) ALL",
+            "ALL ALL=(ALL) ALL",
+            "root, admin ALL=(ALL) /bin/ls, ALL",
+            "User_Alias OPS = bob, admin\nOPS ALL=(ALL) ALL",
+            "# comment\nDefaults env_reset\nadmin ALL=(ALL) \\\n  NOPASSWD: ALL # trailing",
+        ] {
+            assert!(grants(sudoers), "{sudoers:?}");
+        }
+    }
+
+    #[test]
+    fn sudoers_rules_that_do_not_grant_all() {
+        for sudoers in [
+            "",
+            "bob ALL=(ALL) ALL",
+            "%sudo ALL=(ALL) ALL",
+            "admin ALL=(ALL) /usr/bin/systemctl restart sshd",
+            "admin ALL=(postgres) ALL",
+            "# admin ALL=(ALL) ALL",
+            "#includedir /etc/sudoers.d",
+            "%wheel, !admin ALL=(ALL) ALL",
+            "Defaults:admin !requiretty",
+            "User_Alias OPS = bob\nOPS ALL=(ALL) ALL",
+        ] {
+            assert!(!grants(sudoers), "{sudoers:?}");
+        }
     }
 
     #[test]

@@ -19,6 +19,16 @@ PAM authentication module with `PAM_IGNORE`, normally `pam_unix`:
 exists. If it is missing or empty, the module logs that and treats every
 account as local: nothing is sent to the Auth API until it is set.
 
+A break-glass account must also be able to administer the host. At least one
+`local_users` entry has to be UID 0 or be granted `ALL` commands as root by
+`/etc/sudoers` (and the files it includes). If none is, the module logs that
+and treats every account as local, exactly as when `local_users` is unset.
+
+The sudoers check is a best-effort reading of the local files: it does not see
+rules from LDAP or sssd, does not evaluate host lists or netgroups, and does
+not count rules limited to specific commands. If your break-glass account gets
+sudo only through one of those, add a plain rule for it in `/etc/sudoers.d`.
+
 The UID is whatever the host resolves for the name through NSS, whether the
 account lives in `/etc/passwd` or comes from sssd/LDAP. An Auth API user named
 `root@<user_domain>` therefore can never authenticate as the host's `root`.
