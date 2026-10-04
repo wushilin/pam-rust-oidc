@@ -15,20 +15,6 @@ PAM authentication module with `PAM_IGNORE`, normally `pam_unix`:
   `root`;
 - names NSS does not know.
 
-`local_users` must name at least one account, so a break-glass account always
-exists. If it is missing or empty, the module logs that and treats every
-account as local: nothing is sent to the Auth API until it is set.
-
-A break-glass account must also be able to administer the host. At least one
-`local_users` entry has to be UID 0 or be granted `ALL` commands as root by
-`/etc/sudoers` (and the files it includes). If none is, the module logs that
-and treats every account as local, exactly as when `local_users` is unset.
-
-The sudoers check is a best-effort reading of the local files: it does not see
-rules from LDAP or sssd, does not evaluate host lists or netgroups, and does
-not count rules limited to specific commands. If your break-glass account gets
-sudo only through one of those, add a plain rule for it in `/etc/sudoers.d`.
-
 The UID is whatever the host resolves for the name through NSS, whether the
 account lives in `/etc/passwd` or comes from sssd/LDAP. An Auth API user named
 `root@<user_domain>` therefore can never authenticate as the host's `root`.
@@ -44,6 +30,24 @@ is sent to the Auth API unless its name is in `local_users`. In particular:
   it to `local_users` to keep the request from being made;
 - an Auth API account that has sudo rights makes the Auth API a root-level
   trust anchor for the host.
+
+## Break-glass requirement
+
+The Auth API is only used while a working break-glass account exists:
+
+- `local_users` must name at least one account;
+- at least one `local_users` entry must be UID 0 or be granted `ALL` commands
+  as root by `/etc/sudoers` (and the files it includes).
+
+If either condition fails, or the config or one of its files is missing or
+invalid, the module logs the reason and works as local authentication only:
+it prompts `[local] Password:`, asks for no MFA code, sends nothing to the
+Auth API, and leaves every account to the next PAM module.
+
+The sudoers check is a best-effort reading of the local files: it does not see
+rules from LDAP or sssd, does not evaluate host lists or netgroups, and does
+not count rules limited to specific commands. If your break-glass account gets
+sudo only through one of those, add a plain rule for it in `/etc/sudoers.d`.
 
 ## Configuration
 
@@ -106,8 +110,8 @@ auth [success=done default=die] pam_unix.so use_first_pass
 ```
 
 The module prompts every account for `[rust-oidc] Password:` and
-`[rust-oidc] MFA Code:` before it looks at the config or the account, so local
-and remote accounts see the same conversation. It stores the password as
+`[rust-oidc] MFA Code:` before it looks at the account, so local and remote
+accounts see the same conversation. It stores the password as
 `PAM_AUTHTOK`. For local accounts it discards the MFA code (they can press
 Enter), contacts nothing, and returns `PAM_IGNORE`; `pam_unix` then checks the
 stored password. Use `use_first_pass` so `pam_unix` never shows its own prompt.
@@ -117,11 +121,11 @@ runtime error fails closed. For example, PAM user `james` is verified as
 `james@wushilin.net`. Do not mark the OIDC module `sufficient` ahead of
 `pam_unix`: that would let local users bypass their local password check.
 
-If the config or one of its files is missing or invalid, the module logs the
-problem and returns `PAM_IGNORE` for every account, so local and break-glass
-accounts keep working. This is only safe while accounts meant for the Auth API
-have no usable local password (a locked or absent shadow entry); do not use
-`nullok` on `pam_unix` in this stack.
+In local-only mode (see the break-glass requirement above) the module returns
+`PAM_IGNORE` for every account, so local and break-glass accounts keep
+working. This is only safe while accounts meant for the Auth API have no
+usable local password (a locked or absent shadow entry); do not use `nullok`
+on `pam_unix` in this stack.
 
 With sshd, enable `KbdInteractiveAuthentication`. Plain
 `PasswordAuthentication` answers both prompts with the password, so Auth API

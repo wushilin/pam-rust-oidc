@@ -871,13 +871,36 @@ unsafe fn authenticate(
             return PAM_SERVICE_ERR;
         }
     };
-    // Prompt before looking at the config or the account, so every account
-    // sees the same conversation whether it is local, remote, or unknown.
+    // A broken config or a missing break-glass account must not lock out
+    // local accounts: the module then works as local authentication only.
+    let setup = (|| -> Result<Config, String> {
+        let path = module_config(argc, argv)?;
+        let config = Config::load(&path)?;
+        config.validate()?;
+        config.validate_files()?;
+        match config.break_glass_problem() {
+            Some(problem) => Err(problem.into()),
+            None => Ok(config),
+        }
+    })();
+    // In local-only mode the prompt says so and no MFA code is asked for.
+    // Otherwise every account sees the same conversation whether it is
+    // local, remote, or unknown.
+    let local_only = setup.is_err();
     let prompts = (|| -> Result<_, String> {
-        let password = conversation(pamh, "[rust-oidc] Password:", PAM_PROMPT_ECHO_OFF)
+        let label = if local_only {
+            "[local] Password:"
+        } else {
+            "[rust-oidc] Password:"
+        };
+        let password = conversation(pamh, label, PAM_PROMPT_ECHO_OFF)
             .map_err(|_| "password prompt failed")?;
-        let otp = conversation(pamh, "[rust-oidc] MFA Code:", PAM_PROMPT_ECHO_OFF)
-            .map_err(|_| "OTP prompt failed")?;
+        let otp = if local_only {
+            Zeroizing::new(Vec::new())
+        } else {
+            conversation(pamh, "[rust-oidc] MFA Code:", PAM_PROMPT_ECHO_OFF)
+                .map_err(|_| "OTP prompt failed")?
+        };
         set_authtok(pamh, &password).map_err(|_| "could not store the password for PAM")?;
         Ok((password, otp))
     })();
@@ -888,26 +911,13 @@ unsafe fn authenticate(
             return PAM_SERVICE_ERR;
         }
     };
-    // A broken config must not lock out local accounts: defer to the next
-    // module, which checks the stored password against the local database.
-    let setup = (|| -> Result<Config, String> {
-        let path = module_config(argc, argv)?;
-        let config = Config::load(&path)?;
-        config.validate()?;
-        config.validate_files()?;
-        Ok(config)
-    })();
     let config = match setup {
         Ok(value) => value,
         Err(message) => {
-            log(&format!("{message}; deferring to the next PAM module"));
+            log(&format!("{message}; local authentication only"));
             return PAM_IGNORE;
         }
     };
-    if let Some(problem) = config.break_glass_problem() {
-        log(&format!("{problem}; treating every account as local"));
-        return PAM_IGNORE;
-    }
     if config.handled_locally(&username) {
         return PAM_IGNORE;
     }
