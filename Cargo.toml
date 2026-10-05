@@ -1,6 +1,6 @@
 [package]
 name = "pam-rust-oidc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Linux PAM module using an OIDC Credentials.Verify API"
@@ -22,6 +22,9 @@ toml = "0.8"
 x509-parser = "0.16"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"
 
 [profile.release]
 lto = true

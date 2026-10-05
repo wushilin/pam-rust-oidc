@@ -20,10 +20,14 @@ use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 use zeroize::{Zeroize, Zeroizing};
 
+mod provision;
+
 const PAM_SUCCESS: libc::c_int = 0;
 const PAM_SERVICE_ERR: libc::c_int = 3;
 const PAM_AUTH_ERR: libc::c_int = 7;
+const PAM_MAXTRIES: libc::c_int = 11;
 const PAM_IGNORE: libc::c_int = 25;
+const PAM_RHOST_ITEM: libc::c_int = 4;
 const PAM_CONV_ITEM: libc::c_int = 5;
 const PAM_AUTHTOK_ITEM: libc::c_int = 6;
 const PAM_PROMPT_ECHO_OFF: libc::c_int = 1;
@@ -93,6 +97,8 @@ struct Config {
     api_ca_file: Option<PathBuf>,
     #[serde(default)]
     api_tls_insecure_trust_all: bool,
+    #[serde(default)]
+    provisioning: provision::Provisioning,
     client_auth: ClientAuth,
 }
 
@@ -210,6 +216,13 @@ struct TokenReply {
 #[derive(Deserialize)]
 struct VerifyReply {
     result: bool,
+    #[serde(default)]
+    app_roles: Vec<AppRole>,
+}
+
+#[derive(Deserialize)]
+struct AppRole {
+    value: String,
 }
 
 impl Config {
@@ -266,6 +279,7 @@ impl Config {
             return Err("local_users must contain short, non-empty Unix account names".into());
         }
         self.api_trust()?;
+        self.provisioning.validate()?;
         Ok(())
     }
 
@@ -479,13 +493,15 @@ impl Config {
             .map_err(|_| "invalid token endpoint response".into())
     }
 
+    // `Some` holds the roles the user has on this application; `None` means
+    // the credentials were refused.
     fn verify(
         &self,
         client: &Client,
         upn: &str,
         password: &str,
         otp: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<Vec<String>>, String> {
         let token = self.access_token(client)?;
         let response = client
             .post(self.verify_endpoint())
@@ -498,7 +514,11 @@ impl Config {
         }
         response
             .json::<VerifyReply>()
-            .map(|reply| reply.result)
+            .map(|reply| {
+                reply
+                    .result
+                    .then(|| reply.app_roles.into_iter().map(|role| role.value).collect())
+            })
             .map_err(|_| "invalid credential verification response".into())
     }
 }
@@ -888,6 +908,13 @@ fn sudoers_grants_all(lines: &[String], account: &Account) -> bool {
     })
 }
 
+// What sshd passes instead of the real answer for a user it treats as
+// unknown: this pattern repeated to the length of what was typed.
+fn is_sshd_placeholder(answer: &[u8]) -> bool {
+    const JUNK: &[u8] = b"\x08\n\r\x7fINCORRECT";
+    !answer.is_empty() && answer.iter().zip(JUNK.iter().cycle()).all(|(a, b)| a == b)
+}
+
 fn unix_time() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -983,6 +1010,18 @@ unsafe fn pam_user(pamh: *mut libc::c_void) -> Result<String, libc::c_int> {
         .map_err(|_| PAM_AUTH_ERR)
 }
 
+// The address sshd reports for the client, if any.
+unsafe fn remote_host(pamh: *mut libc::c_void) -> Option<String> {
+    let mut item: *const libc::c_void = ptr::null();
+    if pam_get_item(pamh, PAM_RHOST_ITEM, &mut item) != PAM_SUCCESS || item.is_null() {
+        return None;
+    }
+    CStr::from_ptr(item as *const libc::c_char)
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
 fn module_config(argc: libc::c_int, argv: *const *const libc::c_char) -> Result<PathBuf, String> {
     if argc <= 0 || argv.is_null() {
         return Err("config=/absolute/path is required".into());
@@ -1036,6 +1075,20 @@ unsafe fn authenticate(
     // Otherwise every account sees the same conversation whether it is
     // local, remote, or unknown.
     let local_only = setup.is_err();
+    // sshd hides what an unknown user types, so a new account cannot be
+    // verified in this login: create it as pending, show the usual prompts
+    // and end the connection. Nothing tells the client an account was made.
+    let mut created = false;
+    if let Ok(config) = &setup {
+        if config.provisioning.enabled {
+            created = config.provisioning.on_attempt(
+                &username,
+                remote_host(pamh).as_deref(),
+                config.min_uid,
+                &config.local_users,
+            );
+        }
+    }
     let prompts = (|| -> Result<_, String> {
         let label = if local_only {
             "[local] Password:"
@@ -1073,21 +1126,38 @@ unsafe fn authenticate(
     if config.handled_locally(&username) {
         return PAM_IGNORE;
     }
-    let result = (|| -> Result<bool, String> {
+    // sshd replaces the answers of a user it considers unknown, which is the
+    // case when the account appeared after the connection started. Never
+    // send that to the Auth API: it would count as a failed login for the
+    // user. End the connection instead of letting the client retry on it.
+    if created || is_sshd_placeholder(&password) {
+        return PAM_MAXTRIES;
+    }
+    let result = (|| -> Result<Option<Vec<String>>, String> {
         if username.is_empty() || username.contains('@') || username.chars().any(char::is_control) {
             return Err("expected a short Unix username".into());
         }
         let (Ok(password), Ok(otp)) = (std::str::from_utf8(&password), std::str::from_utf8(&otp))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let upn = format!("{}@{}", username, config.user_domain);
         let client = config.http_client()?;
         config.verify(&client, &upn, password, otp)
     })();
     match result {
-        Ok(true) => PAM_SUCCESS,
-        Ok(false) => PAM_AUTH_ERR,
+        Ok(Some(roles)) => {
+            if config.provisioning.enabled {
+                config.provisioning.on_verified(&username, &roles);
+            }
+            PAM_SUCCESS
+        }
+        Ok(None) => {
+            log(&format!(
+                "the Auth API did not accept the login for {username:?}; its audit log has the reason"
+            ));
+            PAM_AUTH_ERR
+        }
         Err(message) => {
             log(&message);
             PAM_SERVICE_ERR
@@ -1347,6 +1417,76 @@ mod tests {
             !reaches(&format!("api_cert_pin_sha256 = \"{wrong}\"\napi_tls_insecure_trust_all = true")),
             "wrong pin with trust all"
         );
+    }
+
+    #[test]
+    fn reads_roles_from_the_verify_reply() {
+        let reply: VerifyReply = serde_json::from_str(
+            r#"{"result": true, "oid": "x", "app_roles": [{"id": "1", "value": "admin"}]}"#,
+        )
+        .unwrap();
+        assert!(reply.result);
+        assert_eq!(reply.app_roles[0].value, "admin");
+        let refused: VerifyReply =
+            serde_json::from_str(r#"{"result": false, "code": "invalid_credentials"}"#).unwrap();
+        assert!(!refused.result && refused.app_roles.is_empty());
+    }
+
+    #[test]
+    fn recognises_the_sshd_placeholder() {
+        for junk in [&b"\x08"[..], b"\x08\n\r\x7fINCORRECT", b"\x08\n\r\x7fINCORRECT\x08\n\r"] {
+            assert!(is_sshd_placeholder(junk), "{junk:?}");
+        }
+        for real in [&b""[..], b"hunter2", b"INCORRECT", b"\x08\n\r\x7fincorrect"] {
+            assert!(!is_sshd_placeholder(real), "{real:?}");
+        }
+    }
+
+    #[test]
+    fn provisioning_section_is_optional() {
+        assert!(!config("").provisioning.enabled);
+    }
+
+    // Parse a config whose last table is [provisioning].
+    fn provisioning_config(body: &str) -> Result<Config, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+            endpoint = "https://auth.example.net/rust-oidc"
+            tenant = "example.net"
+            user_domain = "example.net"
+            client_id = "client"
+            api_scope = "api://api-auth/.default"
+            local_users = ["breakglass"]
+            [client_auth]
+            type = "secret"
+            secret_file = "/etc/pam_rust_oidc/client-secret"
+            [provisioning]
+            {body}
+            "#
+        ))
+    }
+
+    #[test]
+    fn reads_the_provisioning_section() {
+        let config = provisioning_config(
+            "enabled = true\nworking_dir = \"/srv/oidc\"\npending_ttl_minutes = 5\n\
+             max_creations_per_address = 3\ncreation_window_minutes = 30\ncreation_ban_minutes = 120",
+        )
+        .unwrap();
+        let provisioning = &config.provisioning;
+        assert!(provisioning.enabled && config.validate().is_ok());
+        assert_eq!(provisioning.working_dir, Path::new("/srv/oidc"));
+        assert_eq!(provisioning.pending_ttl_minutes, 5);
+        assert_eq!(provisioning.max_creations_per_address, 3);
+        assert_eq!(provisioning.creation_window_minutes, 30);
+        assert_eq!(provisioning.creation_ban_minutes, 120);
+    }
+
+    #[test]
+    fn rejects_bad_provisioning_settings() {
+        assert!(provisioning_config("bogus = 1").is_err());
+        let relative = provisioning_config("working_dir = \"relative\"").unwrap();
+        assert!(relative.validate().is_err());
     }
 
     #[test]

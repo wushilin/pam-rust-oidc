@@ -1,0 +1,24 @@
+; SELinux policy for pam_rust_oidc on hosts where sshd's PAM stack runs in
+; sshd_session_t (OpenSSH 9.8 and later: RHEL, Rocky and Oracle Linux 10).
+; On older releases the domain is sshd_t: replace sshd_session_t throughout.
+;
+; Install:  semodule -i pam_rust_oidc.cil
+; Remove:   semodule -r pam_rust_oidc
+
+; Call the Auth API over HTTPS.
+(allow sshd_session_t http_port_t (tcp_socket (name_connect)))
+
+; On-demand accounts: useradd and userdel run in their own domain, so sshd
+; itself gets no access to the password files.
+(typetransition sshd_session_t useradd_exec_t process useradd_t)
+(allow sshd_session_t useradd_exec_t (file (getattr open read execute map)))
+(allow sshd_session_t useradd_t (process (transition)))
+(allow useradd_t sshd_session_t (fd (use)))
+(allow useradd_t sshd_session_t (process (sigchld)))
+(roletype system_r useradd_t)
+
+; The sudo rule of an on-demand account, /etc/sudoers.d/<name>.
+(allow sshd_session_t etc_t (file (create write rename unlink setattr)))
+
+; useradd inherits a socket from sshd that it never uses; keep that out of the log.
+(dontaudit useradd_t sshd_session_t (unix_stream_socket (read write)))
