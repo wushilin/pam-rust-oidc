@@ -1,6 +1,6 @@
 [package]
 name = "pam-rust-oidc"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Linux PAM module using an OIDC Credentials.Verify API"
@@ -14,8 +14,10 @@ base64 = "0.22"
 jsonwebtoken = "9"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 sha1 = "0.10"
+sha2 = "0.10"
 toml = "0.8"
 x509-parser = "0.16"
 uuid = { version = "1", features = ["v4"] }

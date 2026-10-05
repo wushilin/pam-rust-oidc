@@ -1,8 +1,12 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::blocking::Client;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
@@ -10,6 +14,7 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
@@ -83,8 +88,87 @@ struct Config {
     local_users: Vec<String>,
     #[serde(default = "default_min_uid")]
     min_uid: libc::uid_t,
+    #[serde(default)]
+    api_cert_pin_sha256: CertPins,
     api_ca_file: Option<PathBuf>,
+    #[serde(default)]
+    api_tls_insecure_trust_all: bool,
     client_auth: ClientAuth,
+}
+
+// One fingerprint or a list of them, so the next certificate can be pinned
+// before the server rotates to it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CertPins {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for CertPins {
+    fn default() -> Self {
+        CertPins::Many(Vec::new())
+    }
+}
+
+// How the Auth API server certificate is trusted. Only the first setting
+// present is used: pinned fingerprints, then a CA file, then trust-all, then
+// the built-in public roots.
+enum ApiTrust<'a> {
+    Pinned(Vec<[u8; 32]>),
+    CaFile(&'a Path),
+    InsecureTrustAll,
+    PublicRoots,
+}
+
+// Accepts a server certificate by its SHA-256 fingerprint instead of a CA
+// chain; with no pins it accepts any certificate. The handshake signature is
+// still verified, so the server must hold the certificate's private key.
+#[derive(Debug)]
+struct FingerprintVerifier {
+    pins: Option<Vec<[u8; 32]>>,
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fingerprint: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        match &self.pins {
+            Some(pins) if !pins.contains(&fingerprint) => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )),
+            _ => Ok(ServerCertVerified::assertion()),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
 }
 
 #[derive(Deserialize)]
@@ -181,11 +265,35 @@ impl Config {
         {
             return Err("local_users must contain short, non-empty Unix account names".into());
         }
+        self.api_trust()?;
         Ok(())
     }
 
+    fn api_trust(&self) -> Result<ApiTrust<'_>, String> {
+        let pins = match &self.api_cert_pin_sha256 {
+            CertPins::One(pin) => std::slice::from_ref(pin),
+            CertPins::Many(pins) => pins.as_slice(),
+        };
+        if !pins.is_empty() {
+            return pins
+                .iter()
+                .map(|pin| parse_fingerprint(pin))
+                .collect::<Option<Vec<_>>>()
+                .map(ApiTrust::Pinned)
+                .ok_or_else(|| {
+                    "api_cert_pin_sha256 must contain SHA-256 certificate fingerprints in hex"
+                        .into()
+                });
+        }
+        Ok(match &self.api_ca_file {
+            Some(path) => ApiTrust::CaFile(path),
+            None if self.api_tls_insecure_trust_all => ApiTrust::InsecureTrustAll,
+            None => ApiTrust::PublicRoots,
+        })
+    }
+
     fn validate_files(&self) -> Result<(), String> {
-        if let Some(path) = &self.api_ca_file {
+        if let ApiTrust::CaFile(path) = self.api_trust()? {
             let pem = read_root_only(path, "API CA certificate file")?;
             parse_ca_bundle(&pem)?;
         }
@@ -280,17 +388,32 @@ impl Config {
             .timeout(std::time::Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy();
-        if let Some(path) = &self.api_ca_file {
-            // A configured CA replaces the built-in roots instead of adding to them.
-            builder = builder.tls_built_in_root_certs(false);
-            let pem = read_root_only(path, "API CA certificate file")?;
-            for cert in parse_ca_bundle(&pem)? {
-                builder = builder.add_root_certificate(cert);
+        let pins = match self.api_trust()? {
+            ApiTrust::PublicRoots => return build_client(builder),
+            ApiTrust::CaFile(path) => {
+                // A configured CA replaces the built-in roots instead of adding to them.
+                builder = builder.tls_built_in_root_certs(false);
+                let pem = read_root_only(path, "API CA certificate file")?;
+                for cert in parse_ca_bundle(&pem)? {
+                    builder = builder.add_root_certificate(cert);
+                }
+                return build_client(builder);
             }
-        }
-        builder
-            .build()
-            .map_err(|_| "cannot initialize HTTPS client".into())
+            ApiTrust::Pinned(pins) => Some(pins),
+            ApiTrust::InsecureTrustAll => None,
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(FingerprintVerifier {
+            pins,
+            algorithms: provider.signature_verification_algorithms,
+        });
+        let tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| "cannot initialize HTTPS client")?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        build_client(builder.use_preconfigured_tls(tls))
     }
 
     fn access_token(&self, client: &Client) -> Result<Zeroizing<String>, String> {
@@ -399,6 +522,26 @@ fn parse_ca_bundle(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, String> {
         return Err("API CA certificate bundle contains no certificates".into());
     }
     Ok(certificates)
+}
+
+fn build_client(builder: reqwest::blocking::ClientBuilder) -> Result<Client, String> {
+    builder
+        .build()
+        .map_err(|_| "cannot initialize HTTPS client".into())
+}
+
+// Parse a SHA-256 fingerprint written as 64 hex digits, optionally separated
+// by colons as `openssl x509 -fingerprint` prints them.
+fn parse_fingerprint(text: &str) -> Option<[u8; 32]> {
+    let digits: Vec<u8> = text.bytes().filter(|byte| *byte != b':').collect();
+    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut fingerprint = [0u8; 32];
+    for (byte, pair) in fingerprint.iter_mut().zip(digits.chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(fingerprint)
 }
 
 fn default_min_uid() -> libc::uid_t {
@@ -924,6 +1067,9 @@ unsafe fn authenticate(
             return PAM_IGNORE;
         }
     };
+    if matches!(config.api_trust(), Ok(ApiTrust::InsecureTrustAll)) {
+        log("warning: api_tls_insecure_trust_all is set; the Auth API certificate is not verified");
+    }
     if config.handled_locally(&username) {
         return PAM_IGNORE;
     }
@@ -1124,6 +1270,83 @@ mod tests {
         } else {
             assert!(lines.is_empty());
         }
+    }
+
+    const PIN: &str = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
+                       AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
+
+    #[test]
+    fn parses_fingerprints() {
+        let plain = PIN.replace(':', "").to_lowercase();
+        assert_eq!(parse_fingerprint(PIN), parse_fingerprint(&plain));
+        assert_eq!(parse_fingerprint(PIN).unwrap()[..3], [0xab, 0xcd, 0xef]);
+        for bad in ["", "abcd", &plain[1..], &format!("{}zz", &plain[2..]), &format!("+{}", &plain[1..])] {
+            assert!(parse_fingerprint(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn api_trust_precedence_is_pin_then_ca_then_trust_all() {
+        let all = format!(
+            "api_cert_pin_sha256 = \"{PIN}\"\napi_ca_file = \"/ca.pem\"\napi_tls_insecure_trust_all = true"
+        );
+        assert!(matches!(config(&all).api_trust(), Ok(ApiTrust::Pinned(pins)) if pins.len() == 1));
+        let list = format!("api_cert_pin_sha256 = [\"{PIN}\", \"{PIN}\"]");
+        assert!(matches!(config(&list).api_trust(), Ok(ApiTrust::Pinned(pins)) if pins.len() == 2));
+        let ca = "api_ca_file = \"/ca.pem\"\napi_tls_insecure_trust_all = true";
+        assert!(matches!(config(ca).api_trust(), Ok(ApiTrust::CaFile(_))));
+        let insecure = "api_tls_insecure_trust_all = true";
+        assert!(matches!(config(insecure).api_trust(), Ok(ApiTrust::InsecureTrustAll)));
+        assert!(matches!(config("").api_trust(), Ok(ApiTrust::PublicRoots)));
+        assert!(matches!(config("api_cert_pin_sha256 = []").api_trust(), Ok(ApiTrust::PublicRoots)));
+    }
+
+    #[test]
+    fn rejects_malformed_pins() {
+        let config = config(r#"api_cert_pin_sha256 = "not-a-fingerprint""#);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn fingerprint_verifier_checks_the_pin() {
+        let certificate = CertificateDer::from(b"certificate".to_vec());
+        let name = ServerName::try_from("auth.example.net").unwrap();
+        let verify = |pins| {
+            FingerprintVerifier {
+                pins,
+                algorithms: rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms,
+            }
+            .verify_server_cert(&certificate, &[], &name, &[], UnixTime::now())
+            .is_ok()
+        };
+        let fingerprint: [u8; 32] = Sha256::digest(b"certificate").into();
+        assert!(verify(Some(vec![[0; 32], fingerprint])));
+        assert!(!verify(Some(vec![[0; 32]])));
+        assert!(verify(None));
+    }
+
+    // Live handshake check. Run with, for example:
+    //   PAM_OIDC_TEST_URL=https://auth.example.net PAM_OIDC_TEST_PIN=<hex> \
+    //   cargo test -- --ignored live_tls
+    #[test]
+    #[ignore = "needs network; set PAM_OIDC_TEST_URL and PAM_OIDC_TEST_PIN"]
+    fn live_tls_trust_modes() {
+        let url = std::env::var("PAM_OIDC_TEST_URL").unwrap();
+        let pin = std::env::var("PAM_OIDC_TEST_PIN").unwrap();
+        let reaches = |extra: &str| {
+            let client = config(extra).http_client().unwrap();
+            client.get(&url).send().is_ok()
+        };
+        assert!(reaches(&format!("api_cert_pin_sha256 = \"{pin}\"")), "right pin");
+        let wrong = "00".repeat(32);
+        assert!(!reaches(&format!("api_cert_pin_sha256 = \"{wrong}\"")), "wrong pin");
+        assert!(reaches("api_tls_insecure_trust_all = true"), "trust all");
+        // The pin wins over trust-all.
+        assert!(
+            !reaches(&format!("api_cert_pin_sha256 = \"{wrong}\"\napi_tls_insecure_trust_all = true")),
+            "wrong pin with trust all"
+        );
     }
 
     #[test]

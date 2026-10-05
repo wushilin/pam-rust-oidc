@@ -67,10 +67,10 @@ local_users = ["james", "asdf"]
 # Optional. Accounts with a UID below this are always treated as local.
 min_uid = 1000
 
-# Optional CA PEM/bundle for a private PKI or self-signed API server cert.
-# When set, only these roots are trusted (the built-in public roots are
-# dropped). Hostname and TLS verification stay on.
-api_ca_file = "/etc/pam_rust_oidc/api-ca.pem"
+# Optional. How the API server certificate is trusted; see "API server trust".
+# api_cert_pin_sha256 = "0E:5E:12:...:ED:FC"
+# api_ca_file = "/etc/pam_rust_oidc/api-ca.pem"
+# api_tls_insecure_trust_all = true
 
 [client_auth]
 type = "secret"
@@ -95,6 +95,37 @@ may be `api://api-auth/.default` or `<uuid>/.default`. The module passes this
 value unchanged to the token endpoint. Grant the client application
 `Credentials.Verify` and assign the users who may authenticate to that
 application in the server's admin console.
+
+## API server trust
+
+By default the API server certificate must chain to a public CA and match the
+endpoint's hostname. Three optional settings change that. Only the first one
+present is used; the others are ignored:
+
+1. `api_cert_pin_sha256`: the SHA-256 fingerprint of the server's certificate,
+   or a list of fingerprints so the next certificate can be added before the
+   server rotates to it. Only a server presenting one of these exact
+   certificates (and holding its private key) is accepted. The CA chain,
+   hostname and expiry date are not checked, so this works with self-signed
+   certificates. When the server's certificate changes, Auth API logins fail
+   until the pin is updated.
+2. `api_ca_file`: a CA PEM/bundle for a private PKI. Only these roots are
+   trusted (the built-in public roots are dropped). Hostname and expiry
+   checks stay on.
+3. `api_tls_insecure_trust_all = true`: accept any certificate. Anyone who can
+   intercept the connection can then approve logins and read the passwords,
+   MFA codes and client credentials sent to the API. Use it only on an
+   isolated test network; the module logs a warning on every login while it
+   is in effect.
+
+Print a server's fingerprint with:
+
+```sh
+openssl s_client -connect auth.example.net:443 -servername auth.example.net </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+```
+
+The fingerprint may be written with or without colons, in either case.
 
 ## PAM configuration
 
