@@ -362,16 +362,25 @@ fn run(tool: &str, args: &[&str], input: Option<&[u8]>) -> Option<bool> {
     Some(child.wait().is_ok_and(|status| status.success()))
 }
 
+// Write a new file with exactly this mode. Anything already at the path is
+// removed first, so a leftover (or planted) file never lends its mode or
+// target to the new one.
+fn write_new(path: &Path, mode: u32, content: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    // The mode given at creation is reduced by the umask; set it outright.
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.write_all(content.as_bytes())
+}
+
 // Replace a root-only file in one step, so a reader never sees half of it.
 fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     let temporary = path.with_extension("tmp");
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(content.as_bytes()))?;
+    write_new(&temporary, 0o600, content)?;
     fs::rename(&temporary, path)
 }
 
@@ -602,14 +611,7 @@ impl Provisioning {
         if wanted && existing.as_deref() != Some(&content) {
             // sudo ignores names containing a dot, so the temporary file is inert.
             let temporary = Path::new(SUDOERS_DIR).join(format!(".{name}.tmp"));
-            let written = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o440)
-                .open(&temporary)
-                .and_then(|mut file| file.write_all(content.as_bytes()))
-                .is_ok();
+            let written = write_new(&temporary, 0o440, &content).is_ok();
             let checked = written
                 && temporary
                     .to_str()
@@ -713,6 +715,31 @@ mod tests {
         provisioning.write_state("alice", "active", 400).unwrap();
         assert_eq!(provisioning.read_state("alice"), Some(AccountState::Active));
         assert_eq!(provisioning.pending_accounts(), [("bob".to_string(), 200)]);
+    }
+
+    #[test]
+    fn a_leftover_temporary_file_does_not_weaken_the_new_one() {
+        let scratch = TempDir::new("leftover");
+        let provisioning = scratch.provisioning();
+        provisioning.write_state("alice", "pending", 100).unwrap();
+        // A stale temporary file with a loose mode, as a crash or another
+        // program might leave behind.
+        let stale = provisioning.accounts_dir().join("alice.tmp");
+        fs::write(&stale, "junk").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o666)).unwrap();
+
+        provisioning.write_state("alice", "active", 200).unwrap();
+        assert_eq!(mode(&provisioning.state_path("alice")), 0o600);
+        assert_eq!(provisioning.read_state("alice"), Some(AccountState::Active));
+        assert!(!stale.exists());
+
+        // A symlink planted at the temporary path is replaced, not followed.
+        let target = scratch.0.join("target");
+        fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &stale).unwrap();
+        provisioning.write_state("alice", "pending", 300).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        assert_eq!(provisioning.read_state("alice"), Some(AccountState::Pending(300)));
     }
 
     #[test]
