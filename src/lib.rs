@@ -602,8 +602,12 @@ fn collect_sudoers(path: &Path, depth: u8, lines: &mut Vec<String>) {
         path.parent().unwrap_or(Path::new("/")).join(target)
     };
     for line in logical_lines(&text) {
-        let directive = line.strip_prefix('@').or_else(|| line.strip_prefix('#'));
-        if let Some(target) = directive.and_then(|rest| rest.strip_prefix("includedir ")) {
+        // `@includedir <path>` or `#include <path>`, separated by any whitespace.
+        let directive = line
+            .strip_prefix('@')
+            .or_else(|| line.strip_prefix('#'))
+            .and_then(|rest| rest.split_once(char::is_whitespace));
+        if let Some(("includedir", target)) = directive {
             let Ok(entries) = std::fs::read_dir(resolve(target)) else {
                 continue;
             };
@@ -622,7 +626,7 @@ fn collect_sudoers(path: &Path, depth: u8, lines: &mut Vec<String>) {
                     collect_sudoers(&name, depth + 1, lines);
                 }
             }
-        } else if let Some(target) = directive.and_then(|rest| rest.strip_prefix("include ")) {
+        } else if let Some(("include", target)) = directive {
             if depth < MAX_SUDOERS_DEPTH {
                 collect_sudoers(&resolve(target), depth + 1, lines);
             }
@@ -669,10 +673,12 @@ fn sudoers_commands_grant_all(commands: &str) -> bool {
             let Some((runas, after)) = runas.split_once(')') else {
                 return false;
             };
+            // Any exclusion in the run-as list is treated as excluding root.
             let users = runas.split(':').next().unwrap_or("");
-            as_root = users
-                .split(',')
-                .any(|user| matches!(user.trim(), "ALL" | "root" | "#0"));
+            as_root = !users.contains('!')
+                && users
+                    .split(',')
+                    .any(|user| matches!(user.trim(), "ALL" | "root" | "#0"));
             rest = after.trim_start();
         }
         while let Some((tag, after)) = rest.split_once(':') {
@@ -1090,6 +1096,7 @@ mod tests {
             "%sudo ALL=(ALL) ALL",
             "admin ALL=(ALL) /usr/bin/systemctl restart sshd",
             "admin ALL=(postgres) ALL",
+            "admin ALL=(ALL, !root) ALL",
             "# admin ALL=(ALL) ALL",
             "#includedir /etc/sudoers.d",
             "%wheel, !admin ALL=(ALL) ALL",
@@ -1097,6 +1104,25 @@ mod tests {
             "User_Alias OPS = bob\nOPS ALL=(ALL) ALL",
         ] {
             assert!(!grants(sudoers), "{sudoers:?}");
+        }
+    }
+
+    #[test]
+    fn sudoers_includes_accept_any_whitespace() {
+        let dir = std::env::temp_dir().join(format!("pam-rust-oidc-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sudoers.d")).unwrap();
+        std::fs::write(dir.join("sudoers.d/admins"), "admin ALL=(ALL) ALL\n").unwrap();
+        std::fs::write(dir.join("extra"), "bob ALL=(ALL) ALL\n").unwrap();
+        let main = dir.join("sudoers");
+        std::fs::write(&main, "#includedir\tsudoers.d\n@include  extra\n").unwrap();
+        let mut lines = Vec::new();
+        collect_sudoers(&main, 0, &mut lines);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Files are only read when owned by root, so this passes vacuously otherwise.
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(lines, ["admin ALL=(ALL) ALL", "bob ALL=(ALL) ALL"]);
+        } else {
+            assert!(lines.is_empty());
         }
     }
 
