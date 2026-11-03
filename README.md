@@ -78,6 +78,16 @@ min_uid = 1000
 # api_ca_file = "/etc/pam_rust_oidc/api-ca.pem"
 # api_tls_insecure_trust_all = true
 
+# Optional, on by default. On a refused login, log the password masked to its
+# first and last character (shorter than 6 characters: fully masked) and the
+# OTP, to authpriv syslog. Set to false to log only the username.
+# log_failed_credentials = false
+
+# Optional. Every failed login (local or Auth API) takes this long, counted
+# from when the prompts are answered, so failures cannot be told apart by
+# timing. 1 to 30; keep it above the Auth API's usual response time.
+# failed_login_seconds = 3
+
 [client_auth]
 type = "secret"
 secret_file = "/etc/pam_rust_oidc/client-secret"
@@ -132,9 +142,11 @@ created and verified in one login. It takes two:
 
 1. First attempt with a name the host does not know: the module creates a
    *pending* account (no home directory, no sudo, and a password hash made of
-   random characters, so no password exists that matches it). The user sees the usual password and MFA prompts, the attempt
-   fails and the connection is closed. Nothing tells the client that an
-   account was created, so tell new users to expect one failed login.
+   random characters, so no password exists that matches it). The user sees the usual password and MFA prompts and
+   the attempt fails like a wrong password. sshd keeps treating the name as
+   unknown for the rest of that connection, so further tries in it fail too.
+   Nothing tells the client that an account was created, so tell new users to
+   expect their first connection to fail and to reconnect.
 2. Second attempt: the password and MFA code are verified by the Auth API as
    usual. On success the account becomes *active* and gets its home directory.
 
@@ -416,7 +428,17 @@ The module prompts every account for `[rust-oidc] Password:` and
 `[rust-oidc] MFA Code:` before it looks at the account, so local and remote
 accounts see the same conversation. It stores the password for the modules
 after it (`PAM_AUTHTOK`); `pam_unix` reuses it and does not prompt again.
-Local accounts press Enter at the MFA prompt.
+Local accounts can press Enter at the MFA prompt; its answer is not checked.
+
+Every failure looks the same to the client, whether the account is local,
+remote, unknown, or was just created, and whatever was wrong: the same
+prompts, the same `Permission denied`, the same chance to retry, and the same
+time. The module installs a PAM fail-delay function that ends every failed
+login `failed_login_seconds` after the prompts were answered, replacing the
+delay `pam_unix` or `pam_faildelay` would add; successful logins are not
+delayed. If the Auth API takes longer than that, the failure takes longer
+too. If the application has its own fail-delay function, the module keeps it,
+asks for a plain delay instead, and logs that timing may differ.
 
 In local-only mode every account is left to `pam_unix`. That is only safe
 while accounts meant for the Auth API have no usable local password, so do not
@@ -696,9 +718,11 @@ distribution's PAM module directory (see
 [step 1 of the setup](#1-install-the-module)). There is no prebuilt ARM64
 module; build it on the host.
 
-The module logs only generic configuration/network failure descriptions to the
-auth log. It never logs users' passwords, OTPs, application secrets, client
-assertions, or access tokens. Requests have a 15-second timeout and fail closed.
+The module logs generic configuration/network failure descriptions to the auth
+log. With `log_failed_credentials` (on by default), a login the Auth API
+refuses also logs the password masked to its first and last character and the
+MFA code; set it to `false` to keep both out of the log. It never logs full
+passwords, application secrets, client assertions, or access tokens. Requests have a 15-second timeout and fail closed.
 Proxy environment variables are ignored. Secrets are wiped from the module's
 own buffers on a best-effort basis; copies inside the HTTP and TLS libraries
 are not.
