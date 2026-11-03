@@ -14,8 +14,8 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 use zeroize::{Zeroize, Zeroizing};
@@ -25,13 +25,14 @@ mod provision;
 const PAM_SUCCESS: libc::c_int = 0;
 const PAM_SERVICE_ERR: libc::c_int = 3;
 const PAM_AUTH_ERR: libc::c_int = 7;
-const PAM_MAXTRIES: libc::c_int = 11;
 const PAM_IGNORE: libc::c_int = 25;
 const PAM_RHOST_ITEM: libc::c_int = 4;
 const PAM_CONV_ITEM: libc::c_int = 5;
 const PAM_AUTHTOK_ITEM: libc::c_int = 6;
+const PAM_FAIL_DELAY_ITEM: libc::c_int = 10;
 const PAM_PROMPT_ECHO_OFF: libc::c_int = 1;
 const DEFAULT_MIN_UID: libc::uid_t = 1000;
+const DEFAULT_FAILED_LOGIN_SECONDS: u64 = 3;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const SUDOERS_PATH: &str = "/etc/sudoers";
 const MAX_SUDOERS_DEPTH: u8 = 4;
@@ -78,6 +79,7 @@ extern "C" {
         item_type: libc::c_int,
         item: *const libc::c_void,
     ) -> libc::c_int;
+    fn pam_fail_delay(pamh: *mut libc::c_void, usec: libc::c_uint) -> libc::c_int;
 }
 
 #[derive(Deserialize)]
@@ -97,6 +99,14 @@ struct Config {
     api_ca_file: Option<PathBuf>,
     #[serde(default)]
     api_tls_insecure_trust_all: bool,
+    // On a refused login, log the password masked to its first and last
+    // character and the OTP in full. On unless set to false.
+    #[serde(default = "default_true")]
+    log_failed_credentials: bool,
+    // Every failed login, local or Auth API, ends this long after the
+    // prompts were answered, so its timing does not tell the kinds apart.
+    #[serde(default = "default_failed_login_seconds")]
+    failed_login_seconds: u64,
     #[serde(default)]
     provisioning: provision::Provisioning,
     client_auth: ClientAuth,
@@ -255,6 +265,9 @@ impl Config {
                 "tenant and user_domain must contain only letters, digits, dots, and hyphens"
                     .into(),
             );
+        }
+        if !(1..=30).contains(&self.failed_login_seconds) {
+            return Err("failed_login_seconds must be between 1 and 30".into());
         }
         let endpoint = reqwest::Url::parse(self.endpoint.trim_end_matches('/'))
             .map_err(|_| "endpoint must be an absolute URL")?;
@@ -562,6 +575,14 @@ fn parse_fingerprint(text: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(fingerprint)
+}
+
+fn default_failed_login_seconds() -> u64 {
+    DEFAULT_FAILED_LOGIN_SECONDS
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_min_uid() -> libc::uid_t {
@@ -915,11 +936,74 @@ fn is_sshd_placeholder(answer: &[u8]) -> bool {
     !answer.is_empty() && answer.iter().zip(JUNK.iter().cycle()).all(|(a, b)| a == b)
 }
 
+// The first and last character with a fixed-width mask between them, so the
+// length is not revealed. Short passwords are masked completely.
+fn mask_password(password: &[u8]) -> String {
+    let Ok(text) = std::str::from_utf8(password) else {
+        return "<not UTF-8>".into();
+    };
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 6 {
+        return "****".into();
+    }
+    format!("{}****{}", chars[0], chars[chars.len() - 1])
+}
+
 fn unix_time() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
         .map_err(|_| "system clock is before Unix epoch".into())
+}
+
+// When the login being decided must fail, if it does. Set once the prompts are
+// answered; the prompts are the same for every account, so the time from
+// then to the end of a failure is the same too.
+static FAILURE_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
+
+// Installed as PAM_FAIL_DELAY: libpam calls it when the whole auth stack is
+// done, in place of its own delay. A failure waits until the deadline, so a
+// refusal by the Auth API and one by pam_unix take equally long. Without a
+// deadline (the module never got that far) it waits what libpam would have.
+extern "C" fn equal_failure_delay(
+    status: libc::c_int,
+    usec: libc::c_uint,
+    _appdata: *mut libc::c_void,
+) {
+    let _ = std::panic::catch_unwind(|| {
+        let deadline = FAILURE_DEADLINE
+            .lock()
+            .map(|mut value| value.take())
+            .unwrap_or(None);
+        if status == PAM_SUCCESS {
+            return;
+        }
+        let wait = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => Duration::from_micros(usec.into()),
+        };
+        std::thread::sleep(wait);
+    });
+}
+
+// Use our delay function unless the application installed its own; then
+// fall back to asking libpam for a plain delay, which is not deadline based.
+unsafe fn install_failure_delay(pamh: *mut libc::c_void, seconds: u64) {
+    let ours = equal_failure_delay as *const libc::c_void;
+    let mut current: *const libc::c_void = ptr::null();
+    let installed = pam_get_item(pamh, PAM_FAIL_DELAY_ITEM, &mut current) == PAM_SUCCESS
+        && (current.is_null() || current == ours)
+        && pam_set_item(pamh, PAM_FAIL_DELAY_ITEM, ours) == PAM_SUCCESS;
+    if !installed {
+        log("the application has its own fail delay; failed logins may differ in timing");
+        pam_fail_delay(pamh, (seconds * 1_000_000) as libc::c_uint);
+    }
+}
+
+fn set_failure_deadline(seconds: u64) {
+    if let Ok(mut value) = FAILURE_DEADLINE.lock() {
+        *value = Some(Instant::now() + Duration::from_secs(seconds));
+    }
 }
 
 fn log(message: &str) {
@@ -1113,6 +1197,12 @@ unsafe fn authenticate(
             return PAM_SERVICE_ERR;
         }
     };
+    let failed_login_seconds = setup
+        .as_ref()
+        .map(|config| config.failed_login_seconds)
+        .unwrap_or(DEFAULT_FAILED_LOGIN_SECONDS);
+    set_failure_deadline(failed_login_seconds);
+    install_failure_delay(pamh, failed_login_seconds);
     let config = match setup {
         Ok(value) => value,
         Err(message) => {
@@ -1129,9 +1219,9 @@ unsafe fn authenticate(
     // sshd replaces the answers of a user it considers unknown, which is the
     // case when the account appeared after the connection started. Never
     // send that to the Auth API: it would count as a failed login for the
-    // user. End the connection instead of letting the client retry on it.
+    // user. Fail like any wrong password, so the client cannot tell.
     if created || is_sshd_placeholder(&password) {
-        return PAM_MAXTRIES;
+        return PAM_AUTH_ERR;
     }
     let result = (|| -> Result<Option<Vec<String>>, String> {
         if username.is_empty() || username.contains('@') || username.chars().any(char::is_control) {
@@ -1156,6 +1246,13 @@ unsafe fn authenticate(
             log(&format!(
                 "the Auth API did not accept the login for {username:?}; its audit log has the reason"
             ));
+            if config.log_failed_credentials {
+                log(&format!(
+                    "refused credentials for {username:?}: password {:?}, otp {:?}",
+                    mask_password(&password),
+                    String::from_utf8_lossy(&otp),
+                ));
+            }
             PAM_AUTH_ERR
         }
         Err(message) => {
@@ -1430,6 +1527,39 @@ mod tests {
         let refused: VerifyReply =
             serde_json::from_str(r#"{"result": false, "code": "invalid_credentials"}"#).unwrap();
         assert!(!refused.result && refused.app_roles.is_empty());
+    }
+
+    #[test]
+    fn masks_passwords() {
+        assert_eq!(mask_password(b"hunter22"), "h****2");
+        assert_eq!(mask_password("pässwört".as_bytes()), "p****t");
+        assert_eq!(mask_password(b"short"), "****");
+        assert_eq!(mask_password(b""), "****");
+        assert_eq!(mask_password(b"\x01abcdef\n"), "\x01****\n");
+        assert_eq!(mask_password(b"\xff\xfe"), "<not UTF-8>");
+        assert!(config("").log_failed_credentials);
+        assert_eq!(
+            config("").failed_login_seconds,
+            DEFAULT_FAILED_LOGIN_SECONDS
+        );
+        assert!(config("failed_login_seconds = 0").validate().is_err());
+        assert!(config("failed_login_seconds = 31").validate().is_err());
+        assert!(config("failed_login_seconds = 5").validate().is_ok());
+        assert!(!config("log_failed_credentials = false").log_failed_credentials);
+    }
+
+    #[test]
+    fn failures_wait_for_the_deadline_and_successes_do_not() {
+        let start = Instant::now();
+        *FAILURE_DEADLINE.lock().unwrap() = Some(start + Duration::from_millis(300));
+        equal_failure_delay(PAM_AUTH_ERR, 0, ptr::null_mut());
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(FAILURE_DEADLINE.lock().unwrap().is_none());
+
+        let start = Instant::now();
+        *FAILURE_DEADLINE.lock().unwrap() = Some(start + Duration::from_secs(5));
+        equal_failure_delay(PAM_SUCCESS, 0, ptr::null_mut());
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
