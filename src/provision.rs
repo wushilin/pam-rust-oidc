@@ -126,7 +126,7 @@ impl Lock {
 // real directory owned by the user the module runs as (root). If group or
 // others could only look into it, that is corrected and it is used. If they
 // could write to it, what is in it cannot be trusted and it is refused.
-fn secure_dir(path: &Path) -> Result<(), String> {
+pub(crate) fn secure_dir(path: &Path) -> Result<(), String> {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(());
     };
@@ -149,7 +149,7 @@ fn secure_dir(path: &Path) -> Result<(), String> {
 }
 
 // Create a root-only directory (and its parents) if it is not there yet.
-fn private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> std::io::Result<()> {
     fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
@@ -378,7 +378,7 @@ fn write_new(path: &Path, mode: u32, content: &str) -> std::io::Result<()> {
 }
 
 // Replace a root-only file in one step, so a reader never sees half of it.
-fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     let temporary = path.with_extension("tmp");
     write_new(&temporary, 0o600, content)?;
     fs::rename(&temporary, path)
