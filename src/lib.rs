@@ -20,6 +20,7 @@ use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
 use zeroize::{Zeroize, Zeroizing};
 
+mod offline;
 mod provision;
 
 const PAM_SUCCESS: libc::c_int = 0;
@@ -107,6 +108,10 @@ struct Config {
     // prompts were answered, so its timing does not tell the kinds apart.
     #[serde(default = "default_failed_login_seconds")]
     failed_login_seconds: u64,
+    // While the Auth API cannot be reached, accept the password it last
+    // accepted for a user, if that was within this many days. 0 is off.
+    #[serde(default)]
+    offline_days: u32,
     #[serde(default)]
     provisioning: provision::Provisioning,
     client_auth: ClientAuth,
@@ -235,6 +240,38 @@ struct AppRole {
     value: String,
 }
 
+// Why a login could not be decided. `unreachable` means the Auth API could
+// not be asked at all (no connection, timeout, TLS failure, or a 5xx reply),
+// the only case in which an offline login is considered.
+struct ApiError {
+    message: String,
+    unreachable: bool,
+}
+
+impl ApiError {
+    fn unreachable(message: String) -> Self {
+        ApiError {
+            message,
+            unreachable: true,
+        }
+    }
+}
+
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        ApiError {
+            message,
+            unreachable: false,
+        }
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
 impl Config {
     fn load(path: &Path) -> Result<Self, String> {
         if !path.is_absolute()
@@ -268,6 +305,9 @@ impl Config {
         }
         if !(1..=30).contains(&self.failed_login_seconds) {
             return Err("failed_login_seconds must be between 1 and 30".into());
+        }
+        if self.offline_days > 90 {
+            return Err("offline_days must be between 0 (off) and 90".into());
         }
         let endpoint = reqwest::Url::parse(self.endpoint.trim_end_matches('/'))
             .map_err(|_| "endpoint must be an absolute URL")?;
@@ -443,7 +483,7 @@ impl Config {
         build_client(builder.use_preconfigured_tls(tls))
     }
 
-    fn access_token(&self, client: &Client) -> Result<Zeroizing<String>, String> {
+    fn access_token(&self, client: &Client) -> Result<Zeroizing<String>, ApiError> {
         let token_url = self.token_endpoint();
         let mut form = vec![
             ("grant_type", "client_credentials".to_owned()),
@@ -495,8 +535,15 @@ impl Config {
         for (_, value) in form.iter_mut() {
             value.zeroize();
         }
-        let response =
-            sent.map_err(|error| format!("token endpoint request failed: {error:?}"))?;
+        let response = sent.map_err(|error| {
+            ApiError::unreachable(format!("token endpoint request failed: {error:?}"))
+        })?;
+        if response.status().is_server_error() {
+            return Err(ApiError::unreachable(format!(
+                "token endpoint returned {}",
+                response.status()
+            )));
+        }
         if !response.status().is_success() {
             return Err("token endpoint rejected the application credentials".into());
         }
@@ -514,14 +561,24 @@ impl Config {
         upn: &str,
         password: &str,
         otp: &str,
-    ) -> Result<Option<Vec<String>>, String> {
+    ) -> Result<Option<Vec<String>>, ApiError> {
         let token = self.access_token(client)?;
         let response = client
             .post(self.verify_endpoint())
             .bearer_auth(token.as_str())
             .json(&VerifyRequest { upn, password, otp })
             .send()
-            .map_err(|error| format!("credential verification request failed: {error:?}"))?;
+            .map_err(|error| {
+                ApiError::unreachable(format!(
+                    "credential verification request failed: {error:?}"
+                ))
+            })?;
+        if response.status().is_server_error() {
+            return Err(ApiError::unreachable(format!(
+                "credential verification service returned {}",
+                response.status()
+            )));
+        }
         if !response.status().is_success() {
             return Err("credential verification service returned an error".into());
         }
@@ -1237,7 +1294,7 @@ unsafe fn authenticate(
     if created || is_sshd_placeholder(&password) {
         return PAM_AUTH_ERR;
     }
-    let result = (|| -> Result<Option<Vec<String>>, String> {
+    let result = (|| -> Result<Option<Vec<String>>, ApiError> {
         if username.is_empty() || username.contains('@') || username.chars().any(char::is_control) {
             return Err("expected a short Unix username".into());
         }
@@ -1249,10 +1306,21 @@ unsafe fn authenticate(
         let client = config.http_client()?;
         config.verify(&client, &upn, password, otp)
     })();
+    let working_dir = &config.provisioning.working_dir;
+    if config.offline_days == 0 {
+        offline::forget_all(working_dir);
+    }
     match result {
         Ok(Some(roles)) => {
             if config.provisioning.enabled {
                 config.provisioning.on_verified(&username, &roles);
+            }
+            if config.offline_days > 0 {
+                if let Err(message) = unix_time()
+                    .and_then(|now| offline::remember(working_dir, &username, &password, now))
+                {
+                    log(&format!("{message}; {username:?} cannot log in offline"));
+                }
             }
             PAM_SUCCESS
         }
@@ -1269,8 +1337,29 @@ unsafe fn authenticate(
             }
             PAM_AUTH_ERR
         }
-        Err(message) => {
-            log(&message);
+        Err(error) if error.unreachable && config.offline_days > 0 => {
+            let now = unix_time().unwrap_or(0);
+            match offline::check(working_dir, &username, &password, config.offline_days, now) {
+                Ok(verified_at) => {
+                    log(&format!(
+                        "OFFLINE LOGIN for {username:?}: the Auth API is unreachable ({}); \
+                         accepted the password last verified online {} ago, MFA not checked",
+                        error.message,
+                        offline::age(now.saturating_sub(verified_at)),
+                    ));
+                    PAM_SUCCESS
+                }
+                Err(reason) => {
+                    log(&format!(
+                        "the Auth API is unreachable ({}); no offline login for {username:?}: {reason}",
+                        error.message
+                    ));
+                    PAM_SERVICE_ERR
+                }
+            }
+        }
+        Err(error) => {
+            log(&error.message);
             PAM_SERVICE_ERR
         }
     }
@@ -1559,6 +1648,9 @@ mod tests {
         assert!(config("failed_login_seconds = 0").validate().is_err());
         assert!(config("failed_login_seconds = 31").validate().is_err());
         assert!(config("failed_login_seconds = 5").validate().is_ok());
+        assert_eq!(config("").offline_days, 0);
+        assert!(config("offline_days = 7").validate().is_ok());
+        assert!(config("offline_days = 91").validate().is_err());
         assert!(!config("log_failed_credentials = false").log_failed_credentials);
     }
 
