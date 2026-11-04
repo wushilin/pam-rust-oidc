@@ -80,7 +80,9 @@ min_uid = 1000
 
 # Optional, on by default. On a refused login, log the password masked to its
 # first and last character (shorter than 6 characters: fully masked) and the
-# OTP, to authpriv syslog. Set to false to log only the username.
+# MFA code, to authpriv syslog. An MFA answer that is not 4 to 10 digits, or
+# equals the password, is logged as **garbled**: sshd's password method
+# answers the MFA prompt with the password. Set to false to log only the username.
 # log_failed_credentials = false
 
 # Optional. Every failed login (local or Auth API) takes this long, counted
@@ -721,7 +723,10 @@ module; build it on the host.
 The module logs generic configuration/network failure descriptions to the auth
 log. With `log_failed_credentials` (on by default), a login the Auth API
 refuses also logs the password masked to its first and last character and the
-MFA code; set it to `false` to keep both out of the log. It never logs full
+MFA code (as `**garbled**` unless it is 4 to 10 digits and differs from the
+password, since sshd's password method answers the MFA prompt with the
+password); set it to `false` to keep
+both out of the log. It never logs full
 passwords, application secrets, client assertions, or access tokens. Requests have a 15-second timeout and fail closed.
 Proxy environment variables are ignored. Secrets are wiped from the module's
 own buffers on a best-effort basis; copies inside the HTTP and TLS libraries

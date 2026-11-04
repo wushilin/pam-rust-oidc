@@ -949,6 +949,20 @@ fn mask_password(password: &[u8]) -> String {
     format!("{}****{}", chars[0], chars[chars.len() - 1])
 }
 
+// The MFA answer as logged: quoted when it looks like a code (4 to 10
+// digits) or is empty, otherwise "**garbled**". sshd's password method
+// answers every hidden prompt with the password, so an answer that is not a
+// code, or is the same as the password, may be the password and is never
+// logged.
+fn otp_for_log(otp: &[u8], password: &[u8]) -> String {
+    let looks_like_code = (4..=10).contains(&otp.len()) && otp.iter().all(u8::is_ascii_digit);
+    if otp.is_empty() || (looks_like_code && otp != password) {
+        format!("{:?}", String::from_utf8_lossy(otp))
+    } else {
+        "**garbled**".into()
+    }
+}
+
 fn unix_time() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1248,9 +1262,9 @@ unsafe fn authenticate(
             ));
             if config.log_failed_credentials {
                 log(&format!(
-                    "refused credentials for {username:?}: password {:?}, otp {:?}",
+                    "refused credentials for {username:?}: password {:?}, otp {}",
                     mask_password(&password),
-                    String::from_utf8_lossy(&otp),
+                    otp_for_log(&otp, &password),
                 ));
             }
             PAM_AUTH_ERR
@@ -1546,6 +1560,21 @@ mod tests {
         assert!(config("failed_login_seconds = 31").validate().is_err());
         assert!(config("failed_login_seconds = 5").validate().is_ok());
         assert!(!config("log_failed_credentials = false").log_failed_credentials);
+    }
+
+    #[test]
+    fn logs_only_answers_that_look_like_codes() {
+        assert_eq!(otp_for_log(b"537901", b"hunter22"), "\"537901\"");
+        assert_eq!(otp_for_log(b"1234", b"hunter22"), "\"1234\"");
+        assert_eq!(otp_for_log(b"0123456789", b"hunter22"), "\"0123456789\"");
+        assert_eq!(otp_for_log(b"", b"hunter22"), "\"\"");
+        assert_eq!(otp_for_log(b"123", b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log(b"12345678901", b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log(b"@secret1", b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log(b"53790a", b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log(b" 537901", b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log("５３７９０１".as_bytes(), b"hunter22"), "**garbled**");
+        assert_eq!(otp_for_log(b"482913", b"482913"), "**garbled**");
     }
 
     #[test]
