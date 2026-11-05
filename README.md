@@ -80,13 +80,21 @@ min_uid = 1000
 
 # Optional, on by default. On a refused login, log the password masked to its
 # first and last character (shorter than 6 characters: fully masked) and the
-# OTP, to authpriv syslog. Set to false to log only the username.
+# MFA code, to authpriv syslog. An MFA answer that is not 4 to 10 digits, or
+# equals the password, is logged as **garbled**: sshd's password method
+# answers the MFA prompt with the password. Set to false to log only the username.
 # log_failed_credentials = false
 
 # Optional. Every failed login (local or Auth API) takes this long, counted
 # from when the prompts are answered, so failures cannot be told apart by
 # timing. 1 to 30; keep it above the Auth API's usual response time.
 # failed_login_seconds = 3
+
+# Optional, off by default. While the Auth API cannot be reached, let a user
+# log in with the password the Auth API last accepted for them, if that was
+# within this many days (1 to 90). The MFA code is not checked offline. See
+# "Offline logins".
+# offline_days = 7
 
 [client_auth]
 type = "secret"
@@ -197,6 +205,7 @@ by root only:
 | `accounts/<name>` | one file per account the module created: `pending <time>` or `active <time>` |
 | `stats/addresses` | accounts created per source address, and bans |
 | `lock` | held while accounts or any of these files change, because every login runs in its own process |
+| `offline/<name>` | with `offline_days` set: an Argon2id hash of the password last accepted online, and when (see [Offline logins](#offline-logins)) |
 
 The module creates the directory itself (mode `0700`, files `0600`). If it
 already exists it must be a real directory, owned by root, with no access for
@@ -226,6 +235,51 @@ Removing `stats/addresses` clears all counts and bans.
   this.
 - On hosts with SELinux enforcing, the policy module and labels from
   [step 6 of the setup](#6-selinux-and-apparmor) are required.
+
+## Offline logins
+
+Off by default. With `offline_days` set, Auth API users can still log in
+while the Auth API cannot be reached:
+
+- After every login the Auth API accepts, the module keeps an Argon2id hash of
+  the password in `working_dir/offline/<user>` (root only, `0600`), with the
+  time of that login. The password itself is never stored.
+- If a later login cannot reach the Auth API (no connection, a timeout, a TLS
+  failure, or a 5xx reply from the token or verify endpoint), the module
+  accepts the password if it matches the hash and the hash is at most
+  `offline_days` old. **The MFA code is not checked**: only the Auth API
+  can check it.
+- Each offline login is logged:
+  ```
+  pam_rust_oidc: OFFLINE LOGIN for "alice": the Auth API is unreachable (...); accepted the password last verified online 5h 12m ago, MFA not checked
+  ```
+  A refused offline attempt logs why (`no password is cached for this user`,
+  `the cached password has expired`, `the password does not match the cached
+  one`, ...) and fails like any other login.
+- A reply from the Auth API always decides: a refusal, or a 4xx such as
+  rejected application credentials, never leads to an offline login.
+- Only Unix names of letters, digits, `.`, `_` and `-` (at most 32) are cached.
+- With `offline_days` removed or `0`, the module deletes `offline/` at the next
+  Auth API login, so no hashes are left behind.
+
+`working_dir` is the one from `[provisioning]` (default
+`/var/lib/pam_rust_oidc`); it is used for this even with provisioning off.
+
+What this costs while the Auth API is unreachable:
+
+- A stolen password works without the MFA code, for users who logged in
+  within `offline_days`.
+- Anyone who can cut this host off from the Auth API (a firewall rule, DNS, a
+  network position) can make that happen; they still need a current password.
+- Changes made in the Auth API, such as disabling a user or changing a
+  password, reach this host only at the next online login. A refused login
+  does not remove the cached hash.
+- Roles are not checked: the user keeps the sudo rule from their last online
+  login.
+
+Keep `offline_days` short, and leave it off on hosts where losing MFA during
+an outage is worse than losing access. Local accounts, including the
+break-glass account, are never affected and work the same either way.
 
 ## API server trust
 
@@ -721,7 +775,10 @@ module; build it on the host.
 The module logs generic configuration/network failure descriptions to the auth
 log. With `log_failed_credentials` (on by default), a login the Auth API
 refuses also logs the password masked to its first and last character and the
-MFA code; set it to `false` to keep both out of the log. It never logs full
+MFA code (as `**garbled**` unless it is 4 to 10 digits and differs from the
+password, since sshd's password method answers the MFA prompt with the
+password); set it to `false` to keep
+both out of the log. It never logs full
 passwords, application secrets, client assertions, or access tokens. Requests have a 15-second timeout and fail closed.
 Proxy environment variables are ignored. Secrets are wiped from the module's
 own buffers on a best-effort basis; copies inside the HTTP and TLS libraries
